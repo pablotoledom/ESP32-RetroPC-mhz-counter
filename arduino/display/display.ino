@@ -2,25 +2,25 @@
 #include <SPIFFS.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#include <TFT_eSPI.h>      // Librería para el display
-#include <JPEGDecoder.h>   // Librería para decodificar JPEG
+#include <TFT_eSPI.h>      // Library for the TFT display
+#include <JPEGDecoder.h>   // Library for decoding JPEG images
 
-// ----------------- Configuración del Access Point -----------------
+// ----------------- WiFi Access Point Configuration -----------------
 const char* ssid     = "ESP32-WIFI-video";
 const char* password = "TRC12345678";
 
-// ----------------- Creación del Servidor HTTP y WebSocket -----------------
+// ----------------- Create HTTP Server and WebSocket -----------------
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// ----------------- Configuración del Display TFT -----------------
+// ----------------- TFT Display Configuration -----------------
 TFT_eSPI tft = TFT_eSPI();
 
-// ----------------- Página HTML/JS (Frontend) -----------------
-// Se sirve desde la memoria flash (PROGMEM)
+// ----------------- HTML/JS Page (Frontend) -----------------
+// The page is stored in flash memory (PROGMEM)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -44,7 +44,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <h2 style="font-weight: 500;">Developed by <b>Pablo Toledo</b></h2>
     <div>
       <ul>
-        <li><a href="https://github.com/pablotoledom/">My github</a></li>
+        <li><a href="https://github.com/pablotoledom/">My GitHub</a></li>
         <li><a href="https://theretrocenter.com">The Retro Center website</a></li>
       </ul>
     </div>
@@ -128,93 +128,107 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// ----------------- Buffers para JPEG -----------------
+// ----------------- JPEG Buffers -----------------
 #define MAX_IMAGE_SIZE 30000
 uint8_t imageBufferStatic[MAX_IMAGE_SIZE];
-uint8_t imageBufferProcesamiento[MAX_IMAGE_SIZE];
+uint8_t imageBufferProcess[MAX_IMAGE_SIZE];
 size_t imageBufferLength = 0;
 volatile bool imageReady = false;
 volatile bool processing = false;
 
-// ----------------- Definición del Pin de Señal -----------------
+// ----------------- Signal Pin Definition -----------------
 #define SIGNAL_PIN 12
 
-// ----------------- Definición del Enum para la Máquina de Estados -----------------
-enum Estado {
-  ESTADO_INICIAL,
-  ESTADO_ESPERANDO,
-  ESTADO_CUENTA_REGRESIVA,
-  ESTADO_STREAMING,
-  ESTADO_CUENTA_ASCENDENTE
+// ----------------- Enum for the State Machine -----------------
+enum State {
+  INITIAL_STATE,
+  WAITING_STATE,
+  COUNTDOWN_STATE,
+  STREAMING_STATE,
+  COUNT_STATE
 };
 
-// ----------------- Variables Globales para la Máquina de Estados -----------------
-Estado estadoActual = ESTADO_INICIAL;
-Estado previousState = ESTADO_INICIAL;  // Para detectar cambios de estado
+// ----------------- Global Variables for the State Machine -----------------
+State currentState = INITIAL_STATE;
+State previousState = INITIAL_STATE;  // To detect state changes
 int currentCount = 0;
 unsigned long lastCountUpdate = 0;
 unsigned long delayStartTime = 0;
 #define UPDATE_INTERVAL 20
 #define STEP_COUNT 10
 
-// Variable para controlar la rotación actual del display
+// Variable to control the current display rotation
 int currentRotation = -1;
 
-// ----------------- Función para actualizar el contador en el display -----------------
-// Se modificó para que el número se alinee a la derecha y se muestre en color verde,
-// utilizando (si se dispone) una fuente de 7 segmentos LED personalizada.
-// Variable global para almacenar el último valor mostrado
-// Define las coordenadas y dimensiones del área del contador.
-// Define las constantes para el área del contador.
-const int counterRight = 226;    // Borde derecho donde se alinea el texto
-const int counterY     = -66;      // Coordenada y del área del contador
-const int counterWidth = 240;      // Ancho del área (suficiente para hasta 4 dígitos)
-const int counterH     = 175;      // Altura del área del contador
+// ----------------- Counter Display Area Configuration -----------------
+const int counterRight = 226;    // Right edge for text alignment
+const int counterY     = -66;      // Y coordinate of the counter area
+const int counterWidth = 240;      // Width of the counter area (enough for up to 4 digits)
+const int counterH     = 175;      // Height of the counter area
 
-// Variable global para almacenar el último número mostrado.
+// Global variable to store the last displayed number
 int lastDisplayedNumber = -1;
 
-void updateCounterDisplay(int count) {
-  // Si el número no cambió, no se redibuja.
-  if (count == lastDisplayedNumber) return;
-  lastDisplayedNumber = count;
+// Global flag to force red color for 666 after 3 seconds
+bool forceRed666 = false;
 
-  // Limpia el área donde se mostrará el contador.
-  // Esto borra desde (counterRight - counterWidth, counterY) con ancho counterWidth y altura counterH.
+// ----------------- Function to Update the Counter Display -----------------
+void updateCounterDisplay(int count) {
+  // Determine whether to show blinking or force red for 666
+  bool blinking = (currentState == COUNTDOWN_STATE && count == 666 && delayStartTime != 0);
+  bool forceRed = (forceRed666 && count == 666);
+
+  // If not blinking or forcing red, avoid redrawing if the number hasn't changed
+  if (!blinking && !forceRed) {
+    if (count == lastDisplayedNumber) return;
+    lastDisplayedNumber = count;
+  }
+
+  // Clear the counter display area
   tft.fillRect(counterRight - counterWidth, counterY, counterWidth, counterH, TFT_BLACK);
-  
-  // Configura la fuente, tamaño y color.
-  tft.setTextFont(7);     // Selecciona la fuente incorporada nº7 (o la que prefieras)
-  tft.setTextSize(2);     // Escala el texto (en este ejemplo, 2 veces el tamaño original)
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  
-  // Configura la alineación a la derecha (TR_DATUM: datum = top right).
-  tft.setTextDatum(TR_DATUM);
-  
-  // Dibuja el número. La coordenada (counterRight, counterY + counterH/2)
-  // indica que el extremo derecho del texto estará en counterRight y la parte superior se
-  // ubicará aproximadamente en el centro vertical del área.
-  tft.drawString(String(count), counterRight, counterY + (counterH / 2));
+
+  // Set font, size, and alignment
+  tft.setTextFont(7);         // 7-segment font
+  tft.setTextSize(2);         // Size 2
+  tft.setTextDatum(TR_DATUM);  // Right alignment
+
+  if (blinking) {
+    // Blinking effect in red during the countdown
+    if ((millis() / 500) % 2 == 0) {
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString(String(count), counterRight, counterY + (counterH / 2));
+    }
+  } else if (forceRed) {
+    // Force red: always display in red
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString(String(count), counterRight, counterY + (counterH / 2));
+  } else {
+    // Normal mode: display in green
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString(String(count), counterRight, counterY + (counterH / 2));
+  }
 }
 
-// ----------------- Función para la Máquina de Estados -----------------
+// ----------------- State Machine Function -----------------
 void updateState() {
   unsigned long currentMillis = millis();
   bool signalState = (digitalRead(SIGNAL_PIN) == HIGH);
 
-  // Detectar cambio de estado y limpiar la pantalla al salir del modo streaming.
-  // Forzamos el redibujado reiniciando lastDisplayedNumber y llamando a updateCounterDisplay().
-  if (estadoActual != previousState) {
-    if (estadoActual != ESTADO_STREAMING) {
+  // Detect state change and force redraw on each transition
+  if (currentState != previousState) {
+    // If the new state is not STREAMING, clear the screen and reset the force flag
+    if (currentState != STREAMING_STATE) {
       tft.fillScreen(TFT_BLACK);
-      lastDisplayedNumber = -1;  // Reiniciamos para forzar el redibujado
-      updateCounterDisplay(currentCount); // Fuerza el redibujado inmediato del contador
+      forceRed666 = false;
     }
-    previousState = estadoActual;
+    // Force the counter to be redrawn
+    lastDisplayedNumber = -1;
+    updateCounterDisplay(currentCount);
+    previousState = currentState;
   }
 
-  // Actualizar la rotación:
-  if (estadoActual == ESTADO_STREAMING) {
+  // Update display rotation based on state
+  if (currentState == STREAMING_STATE) {
     if (currentRotation != 0) {
       tft.setRotation(0);
       currentRotation = 0;
@@ -226,30 +240,30 @@ void updateState() {
     }
   }
 
-  // Máquina de Estados
-  switch (estadoActual) {
-    case ESTADO_INICIAL:
+  // State Machine
+  switch (currentState) {
+    case INITIAL_STATE:
       if (currentMillis - lastCountUpdate >= UPDATE_INTERVAL) {
         lastCountUpdate = currentMillis;
         currentCount += STEP_COUNT;
         if (currentCount >= 1400) {
           currentCount = 1400;
-          estadoActual = ESTADO_ESPERANDO;
+          currentState = WAITING_STATE;
         }
         updateCounterDisplay(currentCount);
       }
       break;
 
-    case ESTADO_ESPERANDO:
+    case WAITING_STATE:
       updateCounterDisplay(currentCount);
       if (signalState) {
-        estadoActual = ESTADO_CUENTA_REGRESIVA;
+        currentState = COUNTDOWN_STATE;
         currentCount = 1400;
         lastCountUpdate = currentMillis;
       }
       break;
 
-    case ESTADO_CUENTA_REGRESIVA:
+    case COUNTDOWN_STATE:
       if (currentMillis - lastCountUpdate >= UPDATE_INTERVAL) {
         lastCountUpdate = currentMillis;
         currentCount -= STEP_COUNT;
@@ -260,7 +274,9 @@ void updateState() {
             delayStartTime = currentMillis;
           }
           if (currentMillis - delayStartTime >= 3000) {
-            estadoActual = ESTADO_STREAMING;
+            // After 3 seconds: force the display of 666 in red
+            forceRed666 = true;
+            currentState = STREAMING_STATE;
             delayStartTime = 0;
           }
         } else {
@@ -268,7 +284,7 @@ void updateState() {
         }
       }
       if (!signalState) {
-        estadoActual = ESTADO_CUENTA_ASCENDENTE;
+        currentState = COUNT_STATE;
         currentCount = 666;
         lastCountUpdate = currentMillis;
         updateCounterDisplay(currentCount);
@@ -276,16 +292,16 @@ void updateState() {
       }
       break;
 
-    case ESTADO_STREAMING:
+    case STREAMING_STATE:
       if (!signalState) {
-        estadoActual = ESTADO_CUENTA_ASCENDENTE;
+        currentState = COUNT_STATE;
         currentCount = 666;
         lastCountUpdate = currentMillis;
         updateCounterDisplay(currentCount);
       }
       break;
 
-    case ESTADO_CUENTA_ASCENDENTE:
+    case COUNT_STATE:
       if (currentMillis - lastCountUpdate >= UPDATE_INTERVAL) {
         lastCountUpdate = currentMillis;
         currentCount += STEP_COUNT;
@@ -295,7 +311,7 @@ void updateState() {
         updateCounterDisplay(currentCount);
       }
       if (signalState) {
-        estadoActual = ESTADO_CUENTA_REGRESIVA;
+        currentState = COUNTDOWN_STATE;
         currentCount = 1400;
         lastCountUpdate = currentMillis;
       }
@@ -303,8 +319,7 @@ void updateState() {
   }
 }
 
-
-// ----------------- Callback del WebSocket -----------------
+// ----------------- WebSocket Callback -----------------
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
                void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
@@ -316,41 +331,41 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
   else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*) arg;
     if (info->opcode == WS_BINARY) {
-      if (processing) return;  // Evitar sobrescribir mientras se procesa una imagen
+      if (processing) return;  // Avoid overwriting while processing an image
       if (info->index == 0) {
-        imageBufferLength = 0; // Reinicia el buffer
+        imageBufferLength = 0; // Reset the buffer
       }
       if (imageBufferLength + len <= MAX_IMAGE_SIZE) {
         memcpy(imageBufferStatic + imageBufferLength, data, len);
         imageBufferLength += len;
       } else {
-        Serial.println("Error: Buffer de imagen excedido");
+        Serial.println("Error: Image buffer exceeded");
         imageBufferLength = 0;
       }
       if (info->final) {
-        // Verifica que el JPEG esté completo comprobando el marcador final (0xFF, 0xD9)
+        // Check that the JPEG is complete by verifying the end marker (0xFF, 0xD9)
         if (imageBufferLength >= 2 &&
             imageBufferStatic[imageBufferLength-2] == 0xFF &&
             imageBufferStatic[imageBufferLength-1] == 0xD9) {
-          memcpy(imageBufferProcesamiento, imageBufferStatic, imageBufferLength);
+          memcpy(imageBufferProcess, imageBufferStatic, imageBufferLength);
           imageReady = true;
         } else {
-          Serial.println("JPEG incompleto (no se encontró el marcador final)");
+          Serial.println("Incomplete JPEG (end marker not found)");
         }
       }
     }
   }
 }
 
-// ----------------- Función para procesar la imagen -----------------
+// ----------------- Function to Process the Image -----------------
 void processImage() {
-  // Solo se procesa en modo streaming
-  if (estadoActual != ESTADO_STREAMING) return;
+  // Only process in STREAMING mode
+  if (currentState != STREAMING_STATE) return;
   if (imageReady && !processing) {
     processing = true;
-    int decodeResult = JpegDec.decodeArray(imageBufferProcesamiento, imageBufferLength);
+    int decodeResult = JpegDec.decodeArray(imageBufferProcess, imageBufferLength);
     if (decodeResult == 1) {
-      Serial.println("Decodificación exitosa, mostrando imagen");
+      Serial.println("Decoding successful, displaying image");
       uint16_t mcu_w = JpegDec.MCUWidth;
       uint16_t mcu_h = JpegDec.MCUHeight;
       uint16_t *pImg;
@@ -369,58 +384,58 @@ void processImage() {
         tft.pushImage(mcu_x, mcu_y, block_w, block_h, pImg);
       }
     } else {
-      Serial.printf("Error al decodificar la imagen, código: %d\n", decodeResult);
+      Serial.printf("Error decoding image, code: %d\n", decodeResult);
     }
     imageReady = false;
     processing = false;
-    // Solicita el siguiente frame
+    // Request the next frame
     ws.textAll("requestFrame");
   }
 }
 
-// ----------------- Setup y Loop -----------------
+// ----------------- Setup and Loop -----------------
 void setup() {
   Serial.begin(115200);
-  // Configurar el pin de señal con resistencia interna pull-down
+  // Configure the signal pin with internal pull-down resistor
   pinMode(SIGNAL_PIN, INPUT_PULLDOWN);
 
-  // Iniciar el Access Point
+  // Start the Access Point
   if (WiFi.softAP(ssid, password)) {
-    Serial.println("Access Point iniciado");
+    Serial.println("Access Point started");
     Serial.print("AP IP: ");
     Serial.println(WiFi.softAPIP());
   } else {
-    Serial.println("Error al iniciar Access Point");
+    Serial.println("Error starting Access Point");
   }
 
-  // Iniciar SPIFFS
+  // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
-    Serial.println("Error montando SPIFFS");
+    Serial.println("Error mounting SPIFFS");
     return;
   }
 
-  // Inicializar el display
+  // Initialize the display
   tft.init();
   tft.setSwapBytes(true);
-  // Configura inicialmente para el modo contador (rotación 1)
+  // Initially configure for counter mode (rotation 1)
   tft.setRotation(1);
   currentRotation = 1;
   tft.fillScreen(TFT_BLACK);
 
-  // Configurar WebSocket
+  // Configure WebSocket
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
-  // Servir la página HTML en "/"
+  // Serve the HTML page at "/"
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
   });
   server.begin();
-  Serial.println("Servidor HTTP y WebSocket iniciados");
+  Serial.println("HTTP Server and WebSocket started");
 
-  // Inicializar variables de la máquina de estados
-  estadoActual = ESTADO_INICIAL;
-  previousState = ESTADO_INICIAL;
+  // Initialize state machine variables
+  currentState = INITIAL_STATE;
+  previousState = INITIAL_STATE;
   currentCount = 0;
   lastCountUpdate = millis();
 }
