@@ -6,7 +6,7 @@
 #include <JPEGDecoder.h>   // Library for decoding JPEG images
 
 // ----------------- WiFi Access Point Configuration -----------------
-const char* ssid     = "ESP32-WIFI-video";
+const char* ssid     = "ESP32-WIFI-Pentium-III";
 const char* password = "TRC12345678";
 
 // ----------------- Create HTTP Server and WebSocket -----------------
